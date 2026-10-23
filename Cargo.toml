@@ -1,0 +1,16 @@
+[package]
+name = "memrium-term"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal emulator with a jelly-glass look, tabs and translucent chrome."
+license = "MIT"
+repository = "https://github.com/Supchik22/memrium-term"
+
+[[bin]]
+name = "memrium_term"
+path = "src/main.rs"
+
+[dependencies]
+chebrium = { git = "https://github.com/Supchik22/chebrium" }
+alacritty_terminal = "0.26"
+smithay-client-toolkit = "0.19"
