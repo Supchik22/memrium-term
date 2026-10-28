@@ -14,3 +14,4 @@ path = "src/main.rs"
 chebrium = { git = "https://github.com/Supchik22/chebrium" }
 alacritty_terminal = "0.26"
 smithay-client-toolkit = "0.19"
+libc = "0.2"

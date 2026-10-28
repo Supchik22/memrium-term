@@ -2,7 +2,8 @@
 //!
 //! A Chebrium program (`chebrium::app`) around alacritty_terminal. The window draws its own chrome: traffic lights,
 //! tabs and the "+" button live in the same translucent toolbar as the content, so there is no separate system
-//! titlebar. The terminal paints its whole window itself and hands it to the runtime as one translucent picture.
+//! titlebar. The terminal paints its window itself and hands it to the runtime as translucent pictures, one band for
+//! the toolbar and one per text row: a row that did not change keeps its picture, so only the rows that moved are damaged.
 
 mod fonts;
 mod keys;
@@ -22,11 +23,15 @@ use fonts::{Fonts, Style};
 use chebrium::appmenu::{Item, Menu};
 use chebrium::app::{self, Config, Decorations, Host, Inbox, KeyEvent, Keysym, Modifiers, Outbox, PointerEvt, PointerKind, Waker};
 use chebrium::picture::Pic;
+use chebrium::spring::Spring;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tab::{AppEvent, Tab};
 
 const TOOLBAR: f32 = 34.0;
+/// the cursor's spring: stiff enough to keep up with typing, loose enough to overshoot a little
+const CURSOR_K: f32 = 650.0;
+const CURSOR_ZETA: f32 = 0.7;
 const PAD_X: f32 = 12.0;
 const PAD_TOP: f32 = 6.0;
 const PAD_BOTTOM: f32 = 10.0;
@@ -67,7 +72,7 @@ fn inside(p: (f32, f32), r: (f32, f32, f32, f32)) -> bool {
     p.0 >= r.0 && p.0 <= r.0 + r.2 && p.1 >= r.1 && p.1 <= r.1 + r.3
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Hover {
     None,
     Lights,
@@ -85,7 +90,7 @@ struct Term {
 
     width: u32,
     height: u32,
-    scale: i32,
+    scale: f32,
     configured: bool,
     activated: bool,
     exit: bool,
@@ -111,9 +116,42 @@ struct Term {
     /// requests for the runtime, handed over after each event: a new title, the window to be dragged, the clipboard
     want_title: Option<String>,
     want_drag: bool,
+    /// where a press on the empty toolbar began: dragging from there moves the window
+    press_at: Option<(f32, f32)>,
     want_copy: Option<String>,
     want_paste: bool,
-    /// the window as it was last painted
+    /// the window's pixels (physical, premultiplied) and the bands they are cut into
+    buf: Vec<u8>,
+    bands: Vec<Band>,
+    /// what the bands were laid out for: size in pixels, grid, scale, opacity
+    layout: Option<(usize, usize, usize, usize, u32, u32)>,
+    /// the text cursor floats over the rows on springs (logical px of its top left corner), so it glides between cells
+    cur_x: Spring,
+    cur_y: Spring,
+    /// the cursor was drawn last frame (it snaps to its place when it appears) and in which tab and layout
+    cur_seen: Option<(usize, Option<(usize, usize, usize, usize, u32, u32)>)>,
+    cur_pic: Option<(CursorKey, Arc<Pic>)>,
+}
+
+/// What a cursor picture was drawn from: shape, focus, the character under a block, wide cell, cell size.
+type CursorKey = (u8, bool, char, bool, u32, u32);
+
+/// The text cursor of the active tab: its cell (physical px), shape and the character under it.
+struct Cur {
+    x: f32,
+    y: f32,
+    w: f32,
+    shape: CursorShape,
+    c: char,
+    wide: bool,
+}
+
+/// A horizontal strip of the window (the toolbar, a text row, the padding below) with the picture it was last painted as.
+struct Band {
+    y0: i32,
+    y1: i32,
+    /// what the strip was painted from; `u64::MAX` when it must be painted again
+    hash: u64,
     pic: Option<Arc<Pic>>,
 }
 
@@ -121,11 +159,11 @@ impl Term {
     // ---- geometry
 
     fn cell(&mut self) -> (f32, f32, f32) {
-        self.fonts.cell_metrics(FONT_PX * self.scale as f32)
+        self.fonts.cell_metrics(FONT_PX * self.scale)
     }
 
     fn grid_dims(&mut self) -> (usize, usize) {
-        let s = self.scale as f32;
+        let s = self.scale;
         let (cw, ch, _) = self.cell();
         let usable_w = self.width as f32 * s - 2.0 * PAD_X * s;
         let usable_h = self.height as f32 * s - (TOOLBAR + PAD_TOP + PAD_BOTTOM) * s;
@@ -152,7 +190,9 @@ impl Term {
         let (cols, rows) = self.grid_dims();
         let cell = self.cell_px();
         self.next_id += 1;
-        match Tab::spawn(self.next_id, cols, rows, cell, self.tx.clone()) {
+        // a new tab opens where the one in front is
+        let cwd = self.tabs.get(self.active).and_then(|t| t.cwd());
+        match Tab::spawn(self.next_id, cols, rows, cell, self.tx.clone(), cwd) {
             Ok(t) => {
                 self.tabs.push(t);
                 self.active = self.tabs.len() - 1;
@@ -319,7 +359,7 @@ impl Term {
         }) {
             return Hover::Lights;
         }
-        if self.tabs.len() >= 2 && inside(p, plus_rect(w)) {
+        if inside(p, plus_rect(w)) {
             return Hover::Plus;
         }
         for (i, r) in tab_rects(w, self.tabs.len()).into_iter().enumerate() {
@@ -332,7 +372,7 @@ impl Term {
 
     /// Terminal cell under a logical position (physical-pixel based), with the side of the cell.
     fn cell_at(&mut self, p: (f32, f32)) -> Option<(Point, Side, usize, usize)> {
-        let s = self.scale as f32;
+        let s = self.scale;
         let (cw, ch, _) = self.cell();
         let (cols, rows) = self.grid_dims();
         let x = p.0 * s - PAD_X * s;
@@ -386,8 +426,9 @@ impl Term {
                 }
                 Hover::TabClose(i) => self.close_tab(i),
                 Hover::None => {
+                    // the window moves once the pointer really travels, so a click never shifts it
+                    self.press_at = Some(p);
                     let _ = serial;
-                    self.want_drag = true;
                 }
             }
             return;
@@ -427,6 +468,7 @@ impl Term {
     }
 
     fn release(&mut self, button: u32) {
+        self.press_at = None;
         let p = self.mouse;
         if self.mouse_mode() {
             if let Some((_, _, col, row)) = self.cell_at(p) {
@@ -454,6 +496,14 @@ impl Term {
 
     fn motion(&mut self, p: (f32, f32)) {
         self.mouse = p;
+        if let Some(a) = self.press_at {
+            if self.buttons == 0 {
+                self.press_at = None;
+            } else if (p.0 - a.0).hypot(p.1 - a.1) > 4.0 {
+                self.press_at = None;
+                self.want_drag = true;
+            }
+        }
         let h = self.hover_at(p);
         if h != self.hover {
             self.hover = h;
@@ -516,19 +566,113 @@ impl Term {
         self.dirty = true;
     }
 
-    /// Paint the whole window into a picture (physical pixels, translucent).
-    fn render(&mut self) -> Arc<Pic> {
+    /// Bring the bands up to date: a band is painted again only when what it shows has changed.
+    fn update_bands(&mut self) {
         self.dirty = false;
         let s = self.scale;
         let (cols, rows) = self.grid_dims();
-        let (w, h) = ((self.width as i32 * s) as usize, (self.height as i32 * s) as usize);
-        let mut buf = vec![0u8; w * h * 4];
-        let view = View { w: self.width as f32, s: s as f32, activated: self.activated, hover: self.hover, alpha: self.alpha, cols, rows };
-        {
-            let mut cv = Canvas::new(&mut buf, w, h);
-            paint(&mut cv, &mut self.fonts, &mut self.icons, &self.tabs, self.active, &view);
+        let (pw, ph) = ((self.width as f32 * s).round() as usize, (self.height as f32 * s).round() as usize);
+        let (_, ch, _) = self.fonts.cell_metrics(FONT_PX * s);
+        let layout = (pw, ph, cols, rows, s.to_bits(), self.alpha.to_bits());
+        if self.layout != Some(layout) || self.buf.len() != pw * ph * 4 {
+            self.layout = Some(layout);
+            self.buf = vec![0; pw * ph * 4];
+            let oy = (TOOLBAR + PAD_TOP) * s;
+            let mut edges = vec![0i32];
+            edges.push(oy.round() as i32);
+            for r in 1..=rows {
+                edges.push((oy + r as f32 * ch).round() as i32);
+            }
+            edges.push(ph as i32);
+            for i in 1..edges.len() {
+                edges[i] = edges[i].clamp(edges[i - 1], ph as i32);
+            }
+            self.bands = edges.windows(2).map(|e| Band { y0: e[0], y1: e[1], hash: u64::MAX, pic: None }).collect();
         }
-        Arc::new(Pic::from_bgra_window(w as u32, h as u32, buf))
+        let view = View { w: self.width as f32, s, activated: self.activated, hover: self.hover, alpha: self.alpha, cols, rows };
+        let mut chrome = Fnv::new();
+        chrome.write(format!("{:?}|{}|{}|{}|{}|{}", self.hover, self.activated, self.active, cols, rows, self.tabs.len()).as_bytes());
+        for t in &self.tabs {
+            chrome.write(t.title.as_bytes());
+        }
+        let row_hashes = match self.tabs.get(self.active) {
+            Some(tab) => grid_hashes(tab, rows),
+            None => vec![0; rows],
+        };
+        for i in 0..self.bands.len() {
+            let hash = if i == 0 {
+                chrome.finish()
+            } else if i <= rows {
+                row_hashes[i - 1]
+            } else {
+                0
+            };
+            let (y0, y1) = (self.bands[i].y0, self.bands[i].y1);
+            if self.bands[i].hash == hash || y1 <= y0 {
+                continue;
+            }
+            {
+                let mut cv = Canvas::new(&mut self.buf, pw, ph);
+                cv.set_clip([0, y0, pw as i32, y1]);
+                cv.clear_rect([0, y0, pw as i32, y1], theme::BG, self.alpha);
+                if i == 0 {
+                    paint_chrome(&mut cv, &mut self.fonts, &mut self.icons, &self.tabs, self.active, &view);
+                } else if i <= rows {
+                    if let Some(tab) = self.tabs.get(self.active) {
+                        paint_grid(&mut cv, &mut self.fonts, tab, &view, Some(i as i32 - 1));
+                    }
+                }
+                window_edge(&mut cv, y0, y1, s);
+            }
+            let data = self.buf[y0 as usize * pw * 4..y1 as usize * pw * 4].to_vec();
+            self.bands[i].pic = Some(Arc::new(Pic::from_bgra_window(pw as u32, (y1 - y0) as u32, data)));
+            self.bands[i].hash = hash;
+        }
+    }
+
+    /// The text cursor floats over the rows: it springs to its cell, so it glides when it moves.
+    fn draw_cursor(&mut self, ui: &mut chebrium::ui::Ui<'_>, dt: f32, host: &mut Host) {
+        let s = self.scale;
+        let (cols, rows) = self.grid_dims();
+        let view = View { w: self.width as f32, s, activated: self.activated, hover: self.hover, alpha: self.alpha, cols, rows };
+        let cur = match self.tabs.get(self.active) {
+            Some(tab) => cursor_cell(tab, &view, &mut self.fonts),
+            None => None,
+        };
+        let Some(cur) = cur else {
+            self.cur_seen = None;
+            return;
+        };
+        let (tx, ty) = (cur.x / s, cur.y / s);
+        // a new tab, a new layout or a cursor that was hidden: no gliding from where it used to be
+        let seen = Some((self.active, self.layout));
+        if self.cur_seen != seen {
+            self.cur_seen = seen;
+            for (sp, t) in [(&mut self.cur_x, tx), (&mut self.cur_y, ty)] {
+                sp.x = t;
+                sp.v = 0.0;
+                sp.target = t;
+            }
+        }
+        self.cur_x.target = tx;
+        self.cur_y.target = ty;
+        let dt = dt.clamp(0.0, 0.05);
+        self.cur_x.update(dt);
+        self.cur_y.update(dt);
+        let key: CursorKey = (cur.shape as u8, self.activated, cur.c, cur.wide, cur.w.to_bits(), s.to_bits());
+        if self.cur_pic.as_ref().map(|(k, _)| *k) != Some(key) {
+            let pic = Arc::new(paint_cursor(&mut self.fonts, &cur, &view));
+            self.cur_pic = Some((key, pic));
+        }
+        if let Some((_, pic)) = &self.cur_pic {
+            let m = (2.0 * s).ceil() / s;
+            // on whole device pixels, so the edges stay sharp while it glides
+            let snap = |v: f32| (v * s).round() / s;
+            ui.picture([snap(self.cur_x.x - m), snap(self.cur_y.x - m), pic.w as f32 / s, pic.h as f32 / s], pic, [0.0, 0.0, pic.w as f32, pic.h as f32], 1.0);
+        }
+        if !self.cur_x.at_rest() || !self.cur_y.at_rest() {
+            host.redraw = true;
+        }
     }
 
     /// Hand the runtime what the last event asked of it.
@@ -624,8 +768,15 @@ impl app::App for Term {
         self.flush(host);
     }
 
+    fn dropped(&mut self, files: Vec<std::path::PathBuf>, text: String, host: &mut Host) {
+        // files go to the command line quoted, like in other terminals; text is pasted
+        let line = if files.is_empty() { text } else { files.iter().map(|p| shell_quote(&p.to_string_lossy())).collect::<Vec<_>>().join(" ") + " " };
+        self.write_paste(&line);
+        self.flush(host);
+    }
+
     fn draw(&mut self, ui: &mut chebrium::ui::Ui<'_>, size: [f32; 2], host: &mut Host) {
-        let (w, h, s) = (size[0] as u32, size[1] as u32, host.scale.max(1.0) as i32);
+        let (w, h, s) = (size[0] as u32, size[1] as u32, host.scale.max(1.0));
         if !self.configured || (w, h, s) != (self.width, self.height, self.scale) {
             self.configured = true;
             self.width = w;
@@ -638,12 +789,15 @@ impl app::App for Term {
             self.activated = host.activated;
             self.dirty = true;
         }
-        if self.dirty || self.pic.is_none() {
-            self.pic = Some(self.render());
+        if self.dirty || self.bands.is_empty() {
+            self.update_bands();
         }
-        if let Some(pic) = &self.pic {
-            ui.picture([0.0, 0.0, size[0], size[1]], pic, [0.0, 0.0, pic.w as f32, pic.h as f32], 1.0);
+        for b in &self.bands {
+            if let Some(pic) = &b.pic {
+                ui.picture([0.0, b.y0 as f32 / self.scale, pic.w as f32 / self.scale, (b.y1 - b.y0) as f32 / self.scale], pic, [0.0, 0.0, pic.w as f32, pic.h as f32], 1.0);
+            }
         }
+        self.draw_cursor(ui, ui.dt(), host);
         self.flush(host);
     }
 }
@@ -658,6 +812,15 @@ struct View {
     alpha: f32,
     cols: usize,
     rows: usize,
+}
+
+/// A path for the shell: plain when it is safe, else in single quotes.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%=~".contains(c)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 fn draw_text(cv: &mut Canvas, fonts: &mut Fonts, text: &str, x: f32, baseline: f32, px: f32, color: Rgb, alpha: f32, bold: bool) -> f32 {
@@ -702,10 +865,10 @@ impl Icons {
     }
 }
 
-fn paint(cv: &mut Canvas, fonts: &mut Fonts, icons: &mut Icons, tabs: &[Tab], active: usize, v: &View) {
+/// The toolbar band: the strip, the traffic lights, the tabs and the "+" button.
+fn paint_chrome(cv: &mut Canvas, fonts: &mut Fonts, icons: &mut Icons, tabs: &[Tab], active: usize, v: &View) {
     let s = v.s;
-    let (pw, ph) = (cv.w as i32, cv.h as i32);
-    cv.clear(theme::BG, v.alpha);
+    let pw = cv.w as i32;
 
     // titlebar: a slightly lighter strip, like Terminal.app
     let tb = (TOOLBAR * s) as i32;
@@ -715,10 +878,6 @@ fn paint(cv: &mut Canvas, fonts: &mut Fonts, icons: &mut Icons, tabs: &[Tab], ac
         cv.fill_rect(0, y, pw, y + 1, lerp3([0x3c, 0x3c, 0x3e], [0x2b, 0x2b, 0x2d], t), bar_alpha);
     }
     cv.fill_rect(0, tb, pw, tb + (s as i32).max(1), [0, 0, 0], 0.6);
-
-    if let Some(tab) = tabs.get(active) {
-        paint_grid(cv, fonts, tab, v);
-    }
 
     // ---- chrome
     let ui_px = UI_PX * s;
@@ -778,17 +937,99 @@ fn paint(cv: &mut Canvas, fonts: &mut Fonts, icons: &mut Icons, tabs: &[Tab], ac
         draw_text(cv, fonts, &title, tx, y + h / 2.0 + 4.5 * s, ui_px, theme::FG, if is_active { 0.95 } else { 0.6 }, false);
     }
 
-    // "+" button, only once there is a tab strip (new tab otherwise via Ctrl+Shift+T)
-    if tabs.len() >= 2 {
+    // "+" button: a new tab (Ctrl+Shift+T does the same)
+    {
         let pr = plus_rect(v.w);
         let hot = v.hover == Hover::Plus;
         cv.fill_circle((pr.0 + pr.2 / 2.0) * s, (pr.1 + pr.3 / 2.0) * s, pr.2 / 2.0 * s, [255, 255, 255], if hot { 0.16 } else { 0.07 });
         icons.draw(cv, "plus", (pr.0 + pr.2 / 2.0) * s, (pr.1 + pr.3 / 2.0) * s, 16.0 * s, theme::FG, 0.85);
     }
+}
 
-    // thin light border and rounded window shape
-    cv.stroke_round_rect(0.0, 0.0, pw as f32, ph as f32, RADIUS * s, s.max(1.0), [255, 255, 255], 0.2);
-    cv.mask_round_corners(RADIUS * s);
+/// The window's thin light border and rounded corners on the rows `y0..y1` (what `stroke_round_rect` and
+/// `mask_round_corners` do for the whole window, limited to a band: only the pixels near an edge are visited).
+fn window_edge(cv: &mut Canvas, y0: i32, y1: i32, s: f32) {
+    let (w, h) = (cv.w as i32, cv.h as i32);
+    let (r, t) = (RADIUS * s, s.max(1.0));
+    let ri = r.ceil() as i32;
+    let k = t.ceil() as i32 + 2;
+    let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+    let sd = |px: f32, py: f32| {
+        let qx = (px - cx).abs() - cx + r;
+        let qy = (py - cy).abs() - cy + r;
+        qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r
+    };
+    for y in y0..y1 {
+        let corner_row = y < ri || y >= h - ri;
+        let full = y < k || y >= h - k;
+        let reach = if corner_row { ri.max(k) } else { k };
+        let spans = if full { [(0, w), (0, 0)] } else { [(0, reach.min(w)), ((w - reach).max(0), w)] };
+        for (a, b) in spans {
+            for x in a..b {
+                let d = sd(x as f32 + 0.5, y as f32 + 0.5);
+                let cov = (0.5 - (d + t / 2.0).abs() + t / 2.0).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    cv.blend(x, y, [255, 255, 255], 0.2 * cov);
+                }
+                if corner_row && (x < ri || x >= w - ri) {
+                    let m = (0.5 - d).clamp(0.0, 1.0);
+                    if m < 1.0 {
+                        let i = (y as usize * cv.w + x as usize) * 4;
+                        for c in 0..4 {
+                            cv.data[i + c] = (cv.data[i + c] as f32 * m + 0.5) as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A small, quick hash for telling whether a row of the grid changed.
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Fnv {
+        Fnv(0xcbf29ce484222325)
+    }
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 = (self.0 ^ x as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    fn word(&mut self, v: u64) {
+        self.0 = (self.0 ^ v).wrapping_mul(0x100000001b3);
+        self.0 ^= self.0 >> 29;
+    }
+    fn finish(&self) -> u64 {
+        self.0 & !(1 << 63)
+    }
+}
+
+/// What each visible row looks like, as a hash: its characters, colours, attributes, selection and cursor.
+fn grid_hashes(tab: &Tab, rows: usize) -> Vec<u64> {
+    let mut hs: Vec<Fnv> = (0..rows).map(|_| Fnv::new()).collect();
+    let term = tab.term.lock();
+    let content = term.renderable_content();
+    let off = content.display_offset as i32;
+    let colors = content.colors;
+    let selection = content.selection;
+    for ind in content.display_iter {
+        let row = ind.point.line.0 + off;
+        if row < 0 || row as usize >= hs.len() {
+            continue;
+        }
+        let cell = ind.cell;
+        let fg = theme::resolve_fg(cell.fg, colors, cell.flags.contains(Flags::BOLD));
+        let bg = theme::resolve(cell.bg, colors);
+        let h = &mut hs[row as usize];
+        h.word(cell.c as u64 | (cell.flags.bits() as u64) << 32);
+        h.word(u32::from_le_bytes([fg[0], fg[1], fg[2], 0]) as u64 | (u32::from_le_bytes([bg[0], bg[1], bg[2], matches!(cell.bg, Color::Named(NamedColor::Background)) as u8]) as u64) << 32);
+        if selection.is_some_and(|r| r.contains(ind.point)) {
+            h.word(0x5e1ec7 ^ ind.point.column.0 as u64);
+        }
+    }
+    hs.iter().map(|h| h.finish()).collect()
 }
 
 /// Light/heavy arms for box-drawing characters: (up, down, left, right), 0 none / 1 light / 2 heavy.
@@ -866,7 +1107,8 @@ fn draw_box(cv: &mut Canvas, c: char, x: f32, y: f32, cw: f32, ch: f32, s: f32, 
     true
 }
 
-fn paint_grid(cv: &mut Canvas, fonts: &mut Fonts, tab: &Tab, v: &View) {
+/// The cells of the grid, or of one row of it (`only`).
+fn paint_grid(cv: &mut Canvas, fonts: &mut Fonts, tab: &Tab, v: &View, only: Option<i32>) {
     let s = v.s;
     let (cw, ch, baseline) = fonts.cell_metrics(FONT_PX * s);
     let px = FONT_PX * s;
@@ -877,13 +1119,10 @@ fn paint_grid(cv: &mut Canvas, fonts: &mut Fonts, tab: &Tab, v: &View) {
     let off = content.display_offset as i32;
     let colors = content.colors;
     let selection = content.selection;
-    let cursor = content.cursor;
-    let show_cursor = content.mode.contains(TermMode::SHOW_CURSOR);
-
     for ind in content.display_iter {
         let cell = ind.cell;
         let row = ind.point.line.0 + off;
-        if row < 0 || cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+        if row < 0 || only.is_some_and(|o| o != row) || cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
             continue;
         }
         let col = ind.point.column.0 as f32;
@@ -930,29 +1169,50 @@ fn paint_grid(cv: &mut Canvas, fonts: &mut Fonts, tab: &Tab, v: &View) {
         }
     }
 
-    // cursor
-    let crow = cursor.point.line.0 + off;
-    if show_cursor && cursor.shape != CursorShape::Hidden && crow >= 0 {
-        let (x, y) = (ox + cursor.point.column.0 as f32 * cw, oy + crow as f32 * ch);
-        let cell = &term.grid()[cursor.point];
-        let wide = cell.flags.contains(Flags::WIDE_CHAR);
-        let w = if wide { 2.0 * cw } else { cw };
-        let (xi, yi, xe, ye) = (x.round() as i32, y.round() as i32, (x + w).round() as i32, (y + ch).round() as i32);
-        let focused = v.activated;
-        match (cursor.shape, focused) {
+}
+
+/// Where the cursor is, when it is to be seen.
+fn cursor_cell(tab: &Tab, v: &View, fonts: &mut Fonts) -> Option<Cur> {
+    let (cw, ch, _) = fonts.cell_metrics(FONT_PX * v.s);
+    let term = tab.term.lock();
+    let content = term.renderable_content();
+    let cursor = content.cursor;
+    let row = cursor.point.line.0 + content.display_offset as i32;
+    if !content.mode.contains(TermMode::SHOW_CURSOR) || cursor.shape == CursorShape::Hidden || row < 0 || row as usize >= v.rows {
+        return None;
+    }
+    let cell = &term.grid()[cursor.point];
+    let wide = cell.flags.contains(Flags::WIDE_CHAR);
+    Some(Cur { x: PAD_X * v.s + cursor.point.column.0 as f32 * cw, y: (TOOLBAR + PAD_TOP) * v.s + row as f32 * ch, w: if wide { 2.0 * cw } else { cw }, shape: cursor.shape, c: cell.c, wide })
+}
+
+/// The cursor as a small picture (with a margin for the outline), cell sized, ready to be moved around.
+fn paint_cursor(fonts: &mut Fonts, cur: &Cur, v: &View) -> Pic {
+    let s = v.s;
+    let (_, ch, baseline) = fonts.cell_metrics(FONT_PX * s);
+    let m = (2.0 * s).ceil();
+    let (pw, ph) = ((cur.w + 2.0 * m).ceil() as usize, (ch + 2.0 * m).ceil() as usize);
+    let mut buf = vec![0u8; pw * ph * 4];
+    {
+        let mut cv = Canvas::new(&mut buf, pw, ph);
+        let (x, y) = (m, m);
+        let (xi, yi, xe, ye) = (x.round() as i32, y.round() as i32, (x + cur.w).round() as i32, (y + ch).round() as i32);
+        match (cur.shape, v.activated) {
             (CursorShape::Block, true) => {
-                cv.fill_rect(xi, yi, xe, ye, theme::CURSOR, 0.92);
-                if cell.c != ' ' {
-                    if let Some(g) = fonts.mono_glyph(cell.c, Style::Regular, px) {
+                cv.fill_rect(xi, yi, xe, ye, theme::CURSOR, 1.0);
+                if cur.c != ' ' {
+                    if let Some(g) = fonts.mono_glyph(cur.c, Style::Regular, FONT_PX * s) {
                         cv.glyph(&g, xi, (y + baseline).round() as i32, theme::BG, 1.0);
                     }
                 }
             }
-            (CursorShape::Underline, _) => cv.fill_rect(xi, ye - (2.0 * s) as i32, xe, ye, theme::CURSOR, 0.95),
-            (CursorShape::Beam, _) => cv.fill_rect(xi, yi, xi + (2.0 * s) as i32, ye, theme::CURSOR, 0.95),
-            _ => cv.stroke_round_rect(x, y, w, ch, 2.0 * s, s.max(1.0), theme::CURSOR, 0.9),
+            (CursorShape::Underline, _) => cv.fill_rect(xi, ye - (2.0 * s) as i32, xe, ye, theme::CURSOR, 1.0),
+            (CursorShape::Beam, _) => cv.fill_rect(xi, yi, xi + (2.0 * s) as i32, ye, theme::CURSOR, 1.0),
+            _ => cv.stroke_round_rect(x, y, cur.w, ch, 2.0 * s, s.max(1.0), theme::CURSOR, 1.0),
         }
     }
+    // blended over the rows; a "window" picture would replace them (and punch the transparent margin through)
+    Pic::from_bgra(pw as u32, ph as u32, buf, false, false)
 }
 
 // ------------------------------------------------------------------ wayland handlers
@@ -970,11 +1230,15 @@ fn main() {
         tx,
         width: default_w,
         height: default_h,
-        scale: 1,
+        scale: 1.0,
         configured: false,
         activated: true,
         exit: false,
         dirty: true,
+        cur_x: Spring::new(0.0, CURSOR_K, CURSOR_ZETA),
+        cur_y: Spring::new(0.0, CURSOR_K, CURSOR_ZETA),
+        cur_seen: None,
+        cur_pic: None,
         mods: Modifiers::default(),
         last_key_serial: 0,
         fonts,
@@ -991,9 +1255,12 @@ fn main() {
         alpha: std::env::var("MEMRIUM_TERM_OPACITY").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(DEFAULT_ALPHA).clamp(0.3, 1.0),
         want_title: None,
         want_drag: false,
+        press_at: None,
         want_copy: None,
         want_paste: false,
-        pic: None,
+        buf: Vec::new(),
+        bands: Vec::new(),
+        layout: None,
     };
     term.new_tab();
 
