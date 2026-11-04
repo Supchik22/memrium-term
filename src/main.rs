@@ -11,7 +11,7 @@ mod tab;
 mod theme;
 
 use alacritty_terminal::event::Event as TermEvent;
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
@@ -24,6 +24,7 @@ use chebrium::appmenu::{Item, Menu};
 use chebrium::app::{self, Config, Decorations, Host, Inbox, KeyEvent, Keysym, Modifiers, Outbox, PointerEvt, PointerKind, Waker};
 use chebrium::picture::Pic;
 use chebrium::spring::Spring;
+use chebrium::widgets;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tab::{AppEvent, Tab};
@@ -32,6 +33,11 @@ const TOOLBAR: f32 = 34.0;
 /// the cursor's spring: stiff enough to keep up with typing, loose enough to overshoot a little
 const CURSOR_K: f32 = 650.0;
 const CURSOR_ZETA: f32 = 0.7;
+/// the scroll spring: no overshoot, settles in about a fifth of a second
+const SLIDE_K: f32 = 420.0;
+const SLIDE_ZETA: f32 = 1.0;
+/// the most rows the text may lag behind (a long jump is not worth gliding over)
+const SLIDE_MAX: f32 = 4.0;
 const PAD_X: f32 = 12.0;
 const PAD_TOP: f32 = 6.0;
 const PAD_BOTTOM: f32 = 10.0;
@@ -131,6 +137,12 @@ struct Term {
     /// the cursor was drawn last frame (it snaps to its place when it appears) and in which tab and layout
     cur_seen: Option<(usize, Option<(usize, usize, usize, usize, u32, u32)>)>,
     cur_pic: Option<(CursorKey, Arc<Pic>)>,
+    /// smooth scrolling: how far (in rows) the text still lags behind where the grid now has it; a spring brings it to 0
+    slide: Spring,
+    /// the strip of the history's scrollbar (logical px) while there is history to show, and a press on it is held: the
+    /// toolkit's scrollbar gets those presses instead of the text
+    bar_track: Option<[f32; 4]>,
+    bar_held: bool,
 }
 
 /// What a cursor picture was drawn from: shape, focus, the character under a block, wide cell, cell size.
@@ -264,6 +276,8 @@ impl Term {
                         self.close_tab(idx);
                         return;
                     }
+                    // these change nothing that is drawn (the cursor is drawn by the program, not by the grid)
+                    TermEvent::Bell | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => return,
                     _ => {}
                 }
                 self.schedule();
@@ -555,7 +569,18 @@ impl Term {
             }
         } else {
             // wayland: positive = down; scroll_display: positive = towards history
-            tab.term.lock().scroll_display(Scroll::Delta(-n));
+            let mut term = tab.term.lock();
+            let before = term.grid().display_offset() as i32;
+            term.scroll_display(Scroll::Delta(-n));
+            let moved = term.grid().display_offset() as i32 - before;
+            drop(term);
+            if moved != 0 {
+                // the text is drawn where it was and glides to its new place; the cursor goes along
+                self.slide.x = (self.slide.x - moved as f32).clamp(-SLIDE_MAX, SLIDE_MAX);
+                self.slide.target = 0.0;
+                let ch = self.fonts.cell_metrics(FONT_PX * self.scale).1;
+                self.cur_y.x += moved as f32 * ch / self.scale;
+            }
         }
         self.schedule();
     }
@@ -619,7 +644,7 @@ impl Term {
                     paint_chrome(&mut cv, &mut self.fonts, &mut self.icons, &self.tabs, self.active, &view);
                 } else if i <= rows {
                     if let Some(tab) = self.tabs.get(self.active) {
-                        paint_grid(&mut cv, &mut self.fonts, tab, &view, Some(i as i32 - 1));
+                        paint_grid(&mut cv, &mut self.fonts, tab, &view, Some(i as i32 - 1), (TOOLBAR + PAD_TOP) * s);
                     }
                 }
                 window_edge(&mut cv, y0, y1, s);
@@ -627,6 +652,64 @@ impl Term {
             let data = self.buf[y0 as usize * pw * 4..y1 as usize * pw * 4].to_vec();
             self.bands[i].pic = Some(Arc::new(Pic::from_bgra_window(pw as u32, (y1 - y0) as u32, data)));
             self.bands[i].hash = hash;
+        }
+    }
+
+    /// The area the rows glide in (logical px).
+    fn rows_rect(&self, rows: usize) -> [f32; 4] {
+        let (top, bottom) = (self.bands[1].y0 as f32 / self.scale, self.bands[rows].y1 as f32 / self.scale);
+        [0.0, top, self.width as f32, bottom - top]
+    }
+
+    /// The history's scrollbar at the right edge of the rows, while the normal screen has history above it. Dragging it
+    /// moves the view through the history a whole row at a time.
+    fn draw_scrollbar(&mut self, ui: &mut chebrium::ui::Ui<'_>, rows: usize, host: &mut Host) {
+        let ch = self.cell().1 / self.scale;
+        let view = self.tabs.get(self.active).and_then(|tab| {
+            let term = tab.term.lock();
+            let hist = term.grid().history_size();
+            (hist > 0 && !term.mode().contains(TermMode::ALT_SCREEN)).then(|| (hist, term.grid().display_offset()))
+        });
+        let Some((hist, off)) = view.filter(|_| ch > 0.0 && self.bands.len() > rows) else {
+            self.bar_track = None;
+            return;
+        };
+        let track = widgets::bar_track(self.rows_rect(rows));
+        self.bar_track = Some(track);
+        let mut offset = (hist - off.min(hist)) as f32 * ch;
+        if widgets::scrollbar(ui, track, (hist + rows) as f32 * ch, rows as f32 * ch, &mut offset) {
+            let want = hist as i32 - (offset / ch).round() as i32;
+            let delta = want - off as i32;
+            if delta != 0 {
+                if let Some(tab) = self.tabs.get(self.active) {
+                    tab.term.lock().scroll_display(Scroll::Delta(delta));
+                }
+                self.dirty = true;
+                host.redraw = true;
+            }
+        }
+    }
+
+    /// While the text glides, the rows beyond the grid that slide into view: painted when needed, as the grid does not hold them.
+    fn draw_extra_rows(&mut self, ui: &mut chebrium::ui::Ui<'_>, rows: usize, ch: f32, shift: f32) {
+        let s = self.scale;
+        let pw = (self.width as f32 * s).round() as usize;
+        let hrow = ch.round().max(1.0) as usize;
+        let oy = (TOOLBAR + PAD_TOP) * s;
+        let view = View { w: self.width as f32, s, activated: self.activated, hover: self.hover, alpha: self.alpha, cols: self.grid_dims().0, rows };
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        for j in 1..=(self.slide.x.abs().ceil() as i32) {
+            // the text lags upwards (negative): rows come in from below, else from above
+            let r = if self.slide.x < 0.0 { rows as i32 - 1 + j } else { -j };
+            let mut buf = vec![0u8; pw * hrow * 4];
+            {
+                let mut cv = Canvas::new(&mut buf, pw, hrow);
+                cv.clear_rect([0, 0, pw as i32, hrow as i32], theme::BG, self.alpha);
+                paint_grid(&mut cv, &mut self.fonts, tab, &view, Some(r), oy + r as f32 * ch);
+            }
+            let pic = Arc::new(Pic::from_bgra_window(pw as u32, hrow as u32, buf));
+            let y = (oy + r as f32 * ch).round() / s + shift;
+            ui.picture([0.0, y, pic.w as f32 / s, pic.h as f32 / s], &pic, [0.0, 0.0, pic.w as f32, pic.h as f32], 1.0);
         }
     }
 
@@ -644,10 +727,13 @@ impl Term {
             return;
         };
         let (tx, ty) = (cur.x / s, cur.y / s);
+        let ch = self.fonts.cell_metrics(FONT_PX * s).1;
         // a new tab, a new layout or a cursor that was hidden: no gliding from where it used to be
         let seen = Some((self.active, self.layout));
         if self.cur_seen != seen {
             self.cur_seen = seen;
+            self.slide.x = 0.0;
+            self.slide.v = 0.0;
             for (sp, t) in [(&mut self.cur_x, tx), (&mut self.cur_y, ty)] {
                 sp.x = t;
                 sp.v = 0.0;
@@ -668,7 +754,15 @@ impl Term {
             let m = (2.0 * s).ceil() / s;
             // on whole device pixels, so the edges stay sharp while it glides
             let snap = |v: f32| (v * s).round() / s;
-            ui.picture([snap(self.cur_x.x - m), snap(self.cur_y.x - m), pic.w as f32 / s, pic.h as f32 / s], pic, [0.0, 0.0, pic.w as f32, pic.h as f32], 1.0);
+            let lag = self.slide.x * ch / s;
+            let sliding = self.slide.x != 0.0;
+            if sliding {
+                ui.push_clip(self.rows_rect(rows));
+            }
+            ui.picture([snap(self.cur_x.x - m), snap(self.cur_y.x + lag - m), pic.w as f32 / s, pic.h as f32 / s], pic, [0.0, 0.0, pic.w as f32, pic.h as f32], 1.0);
+            if sliding {
+                ui.pop_clip();
+            }
         }
         if !self.cur_x.at_rest() || !self.cur_y.at_rest() {
             host.redraw = true;
@@ -741,11 +835,29 @@ impl app::App for Term {
     fn raw_pointer(&mut self, event: &PointerEvt, mods: &Modifiers, host: &mut Host) -> bool {
         self.mods = *mods;
         let p = (event.pos[0], event.pos[1]);
+        let on_bar = self.bar_track.is_some_and(|t| chebrium::ui::inside(event.pos, t));
+        // moves also go to the widgets (the scrollbar lights up under the pointer); a press on the bar and its release
+        // are the scrollbar's alone
+        let mut widgets_too = false;
         match event.kind {
-            PointerKind::Enter | PointerKind::Motion => self.motion(p),
+            PointerKind::Enter | PointerKind::Motion => {
+                if !self.bar_held {
+                    self.motion(p);
+                }
+                widgets_too = true;
+            }
             PointerKind::Leave => {
                 self.hover = Hover::None;
                 self.schedule();
+                widgets_too = true;
+            }
+            PointerKind::Press { button, .. } if button == BTN_LEFT && on_bar => {
+                self.bar_held = true;
+                widgets_too = true;
+            }
+            PointerKind::Release { .. } if self.bar_held => {
+                self.bar_held = false;
+                widgets_too = true;
             }
             PointerKind::Press { button, serial } => {
                 self.mouse = p;
@@ -760,7 +872,7 @@ impl app::App for Term {
             PointerKind::Axis { dy, discrete_y, .. } => self.scroll(dy as f64, discrete_y),
         }
         self.flush(host);
-        true
+        !widgets_too
     }
 
     fn clipboard(&mut self, text: String, host: &mut Host) {
@@ -792,12 +904,30 @@ impl app::App for Term {
         if self.dirty || self.bands.is_empty() {
             self.update_bands();
         }
-        for b in &self.bands {
-            if let Some(pic) = &b.pic {
-                ui.picture([0.0, b.y0 as f32 / self.scale, pic.w as f32 / self.scale, (b.y1 - b.y0) as f32 / self.scale], pic, [0.0, 0.0, pic.w as f32, pic.h as f32], 1.0);
+        self.slide.update(ui.dt().clamp(0.0, 0.05));
+        let rows = self.grid_dims().1;
+        let ch = self.fonts.cell_metrics(FONT_PX * self.scale).1;
+        let shift = self.slide.x * ch / self.scale;
+        for i in 0..self.bands.len() {
+            let b = &self.bands[i];
+            let Some(pic) = b.pic.clone() else { continue };
+            let (y0, y1) = (b.y0, b.y1);
+            // the rows glide, the toolbar and the bottom margin stay
+            let dy = if i >= 1 && i <= rows { shift } else { 0.0 };
+            if i == 1 && self.slide.x != 0.0 {
+                ui.push_clip(self.rows_rect(rows));
+            }
+            ui.picture([0.0, y0 as f32 / self.scale + dy, pic.w as f32 / self.scale, (y1 - y0) as f32 / self.scale], &pic, [0.0, 0.0, pic.w as f32, pic.h as f32], 1.0);
+            if i == rows && self.slide.x != 0.0 {
+                self.draw_extra_rows(ui, rows, ch, shift);
+                ui.pop_clip();
             }
         }
         self.draw_cursor(ui, ui.dt(), host);
+        self.draw_scrollbar(ui, rows, host);
+        if !self.slide.at_rest() {
+            host.redraw = true;
+        }
         self.flush(host);
     }
 }
@@ -1108,24 +1238,40 @@ fn draw_box(cv: &mut Canvas, c: char, x: f32, y: f32, cw: f32, ch: f32, s: f32, 
 }
 
 /// The cells of the grid, or of one row of it (`only`).
-fn paint_grid(cv: &mut Canvas, fonts: &mut Fonts, tab: &Tab, v: &View, only: Option<i32>) {
+///
+/// `only` may name a row beyond the grid (a line of the history sliding in, or of the screen sliding out): it is read
+/// from the grid directly. `top` is the y of row 0 in `cv` (the grid starts below the toolbar, or elsewhere in a scratch picture).
+fn paint_grid(cv: &mut Canvas, fonts: &mut Fonts, tab: &Tab, v: &View, only: Option<i32>, top: f32) {
     let s = v.s;
     let (cw, ch, baseline) = fonts.cell_metrics(FONT_PX * s);
     let px = FONT_PX * s;
-    let (ox, oy) = (PAD_X * s, (TOOLBAR + PAD_TOP) * s);
+    let (ox, oy) = (PAD_X * s, top);
 
     let term = tab.term.lock();
     let content = term.renderable_content();
     let off = content.display_offset as i32;
     let colors = content.colors;
     let selection = content.selection;
-    for ind in content.display_iter {
-        let cell = ind.cell;
-        let row = ind.point.line.0 + off;
-        if row < 0 || only.is_some_and(|o| o != row) || cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+    // one row is read from the grid itself: walking the whole screen for each row repainted made a full-screen update
+    // (a long `cat`, htop, a build) cost rows x cells
+    let cells: Vec<_> = match only {
+        Some(r) => {
+            let grid = term.grid();
+            let line = Line(r - off);
+            if line < grid.topmost_line() || line > grid.bottommost_line() {
+                Vec::new()
+            } else {
+                (0..grid.columns()).map(|c| (Point::new(line, Column(c)), &grid[Point::new(line, Column(c))])).collect()
+            }
+        }
+        _ => content.display_iter.map(|i| (i.point, i.cell)).collect(),
+    };
+    for (point, cell) in cells {
+        let row = point.line.0 + off;
+        if only.is_some_and(|o| o != row) || cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
             continue;
         }
-        let col = ind.point.column.0 as f32;
+        let col = point.column.0 as f32;
         let wide = cell.flags.contains(Flags::WIDE_CHAR);
         let (x, y) = (ox + col * cw, oy + row as f32 * ch);
         let w = if wide { 2.0 * cw } else { cw };
@@ -1137,7 +1283,7 @@ fn paint_grid(cv: &mut Canvas, fonts: &mut Fonts, tab: &Tab, v: &View, only: Opt
             std::mem::swap(&mut fg, &mut bg);
         }
         let mut draw_bg = inverse || !matches!(cell.bg, Color::Named(NamedColor::Background));
-        if selection.is_some_and(|r| r.contains(ind.point)) {
+        if selection.is_some_and(|r| r.contains(point)) {
             bg = SEL_BG;
             fg = [255, 255, 255];
             draw_bg = true;
@@ -1237,6 +1383,9 @@ fn main() {
         dirty: true,
         cur_x: Spring::new(0.0, CURSOR_K, CURSOR_ZETA),
         cur_y: Spring::new(0.0, CURSOR_K, CURSOR_ZETA),
+        slide: Spring::new(0.0, SLIDE_K, SLIDE_ZETA),
+        bar_track: None,
+        bar_held: false,
         cur_seen: None,
         cur_pic: None,
         mods: Modifiers::default(),

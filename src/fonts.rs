@@ -70,6 +70,8 @@ pub struct Fonts {
     /// characters we already failed to find a fallback for
     missing: std::collections::HashSet<char>,
     tried_paths: std::collections::HashSet<String>,
+    /// glyphs already found for (style, character, size): the fast path of `mono_glyph`
+    drawn: HashMap<(Style, char, u32), Rc<Glyph>>,
 }
 
 impl Fonts {
@@ -93,6 +95,7 @@ impl Fonts {
             fallbacks: Vec::new(),
             missing: Default::default(),
             tried_paths: Default::default(),
+            drawn: HashMap::new(),
         }
     }
 
@@ -136,6 +139,21 @@ impl Fonts {
 
     /// Glyph for `c` in `style`, with fontconfig-based fallback for characters the main font lacks.
     pub fn mono_glyph(&mut self, c: char, style: Style, px: f32) -> Option<Rc<Glyph>> {
+        // one lookup for a glyph that was drawn before (the slow path below asks the font's cmap and several maps)
+        let key = (style, c, px.to_bits());
+        if let Some(g) = self.drawn.get(&key) {
+            return Some(g.clone());
+        }
+        let g = self.mono_glyph_slow(c, style, px)?;
+        // a size change or a very long session must not keep every glyph for ever
+        if self.drawn.len() > 16_384 {
+            self.drawn.clear();
+        }
+        self.drawn.insert(key, g.clone());
+        Some(g)
+    }
+
+    fn mono_glyph_slow(&mut self, c: char, style: Style, px: f32) -> Option<Rc<Glyph>> {
         if self.mono_face(style).has(c) {
             return Some(self.mono_face(style).glyph(c, px));
         }
