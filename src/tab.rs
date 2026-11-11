@@ -14,6 +14,8 @@ pub type TabId = u64;
 /// Messages from background threads to the program (each one wakes it).
 pub enum AppEvent {
     Term(TabId, Event),
+    /// a picture of a path in the text was decoded for the preview (none: it could not be)
+    Peek(std::path::PathBuf, Option<Arc<crate::peek::Preview>>),
 }
 
 #[derive(Clone)]

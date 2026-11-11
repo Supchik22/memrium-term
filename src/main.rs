@@ -7,6 +7,7 @@
 
 mod fonts;
 mod keys;
+mod peek;
 mod tab;
 mod theme;
 
@@ -27,6 +28,7 @@ use chebrium::spring::Spring;
 use chebrium::widgets;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use peek::{Hit, Peek};
 use tab::{AppEvent, Tab};
 
 const TOOLBAR: f32 = 34.0;
@@ -113,6 +115,10 @@ struct Term {
 
     mouse: (f32, f32),
     hover: Hover,
+    /// a picture path under the pointer (underlined; a preview floats beside it), since when, and the previews
+    peek: Peek,
+    peek_hit: Option<Hit>,
+    peek_since: Instant,
     selecting: bool,
     buttons: u8,
     last_click: Option<(Instant, Point, u8)>,
@@ -244,6 +250,10 @@ impl Term {
 
     fn handle_event(&mut self, ev: AppEvent) {
         match ev {
+            AppEvent::Peek(path, p) => {
+                self.peek.loaded(path, p);
+                self.schedule();
+            }
             AppEvent::Term(id, ev) => {
                 let Some(idx) = self.tabs.iter().position(|t| t.id == id) else { return };
                 match ev {
@@ -320,6 +330,7 @@ impl Term {
     // ---- keyboard
 
     fn on_key(&mut self, event: KeyEvent) {
+        self.peek_hit = None;
         let m = self.mods;
         let cmd = m.logo || (m.ctrl && m.shift);
         if cmd {
@@ -448,6 +459,13 @@ impl Term {
             return;
         }
         let Some((point, side, col, row)) = self.cell_at(p) else { return };
+        if button == BTN_LEFT && self.mods.ctrl && !self.mods.shift {
+            if let Some(hit) = self.peek_hit.take() {
+                peek::open_viewer(&hit.path);
+                self.schedule();
+                return;
+            }
+        }
         if self.mouse_mode() {
             let code = match button {
                 BTN_LEFT => 0,
@@ -524,9 +542,24 @@ impl Term {
             self.schedule();
         }
         if p.1 <= TOOLBAR {
+            if self.peek_hit.take().is_some() {
+                self.schedule();
+            }
             return;
         }
         let Some((point, side, col, row)) = self.cell_at(p) else { return };
+        // a picture path under the pointer (also in programs that take the mouse: the preview is only a look)
+        if !self.selecting && self.buttons == 0 && std::env::var_os("TERM_PEEK_TEST").is_none() {
+            let hit = self.peek_find(point);
+            if std::env::var_os("TERM_PEEK_DEBUG").is_some() {
+                eprintln!("peek: cell {:?} mouse_mode {} -> {:?}", point, self.mouse_mode(), hit.as_ref().map(|h| &h.path));
+            }
+            if hit != self.peek_hit {
+                self.peek_hit = hit;
+                self.peek_since = Instant::now();
+                self.schedule();
+            }
+        }
         if self.mouse_mode() {
             let mode = self.tabs.get(self.active).map(|t| *t.term.lock().mode()).unwrap_or(TermMode::NONE);
             let drag = mode.contains(TermMode::MOUSE_DRAG) && self.buttons != 0;
@@ -536,6 +569,7 @@ impl Term {
             return;
         }
         if self.selecting {
+            self.peek_hit = None;
             if let Some(tab) = self.tabs.get(self.active) {
                 if let Some(sel) = tab.term.lock().selection.as_mut() {
                     sel.update(point, side);
@@ -546,6 +580,7 @@ impl Term {
     }
 
     fn scroll(&mut self, absolute: f64, discrete: i32) {
+        self.peek_hit = None;
         let lines = if discrete != 0 { discrete as f64 } else { absolute / (FONT_PX as f64 * 1.3) };
         self.scroll_acc += lines;
         let n = self.scroll_acc.trunc() as i32;
@@ -575,9 +610,7 @@ impl Term {
             let moved = term.grid().display_offset() as i32 - before;
             drop(term);
             if moved != 0 {
-                // the text is drawn where it was and glides to its new place; the cursor goes along
-                self.slide.x = (self.slide.x - moved as f32).clamp(-SLIDE_MAX, SLIDE_MAX);
-                self.slide.target = 0.0;
+                // the text jumps to its new place at once (no glide); the cursor goes along
                 let ch = self.fonts.cell_metrics(FONT_PX * self.scale).1;
                 self.cur_y.x += moved as f32 * ch / self.scale;
             }
@@ -589,6 +622,116 @@ impl Term {
 
     fn schedule(&mut self) {
         self.dirty = true;
+    }
+
+    /// The picture path at a cell of the text, when there is one that names an existing picture. A path the shell
+    /// wrapped over several rows is read whole.
+    fn peek_find(&mut self, point: Point) -> Option<Hit> {
+        let tab = self.tabs.get(self.active)?;
+        let (chars, cells, at, off) = {
+            let term = tab.term.lock();
+            let grid = term.grid();
+            let cols = grid.columns();
+            let (top, bottom) = (grid.topmost_line(), grid.bottommost_line());
+            if point.line < top || point.line > bottom {
+                return None;
+            }
+            let wraps = |l: Line| grid[l][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+            let mut first = point.line;
+            for _ in 0..6 {
+                if first > top && wraps(Line(first.0 - 1)) {
+                    first = Line(first.0 - 1);
+                }
+            }
+            let (mut chars, mut cells, mut at) = (Vec::new(), Vec::new(), None);
+            let mut l = first;
+            for _ in 0..8 {
+                for c in 0..cols {
+                    let cell = &grid[l][Column(c)];
+                    if l == point.line && c == point.column.0 {
+                        at = Some(chars.len());
+                    }
+                    chars.push(if cell.flags.contains(Flags::WIDE_CHAR_SPACER) { '\0' } else { cell.c });
+                    cells.push((l.0, c));
+                }
+                if l < bottom && wraps(l) {
+                    l = Line(l.0 + 1);
+                } else {
+                    break;
+                }
+            }
+            (chars, cells, at?, grid.display_offset() as i32)
+        };
+        let (a, b, text) = peek::path_in(&chars, at)?;
+        let path = peek::resolve(&text, tab.cwd().as_deref())?;
+        // where its characters are, row by row (screen rows: the scrolled-back view moves them)
+        let mut spans: Vec<(i32, usize, usize)> = Vec::new();
+        for &(line, col) in &cells[a..b] {
+            match spans.last_mut() {
+                Some(s) if s.0 == line + off && s.2 == col => s.2 = col + 1,
+                _ => spans.push((line + off, col, col + 1)),
+            }
+        }
+        Some(Hit { path, spans })
+    }
+
+    /// The underline of a picture path under the pointer and, after a moment, the preview beside it.
+    fn draw_peek(&mut self, ui: &mut chebrium::ui::Ui<'_>, host: &mut Host) {
+        let Some(hit) = self.peek_hit.clone() else { return };
+        let s = self.scale;
+        let (cw, ch, _) = self.cell();
+        let (cw, ch) = (cw / s, ch / s);
+        let row_y = |r: i32| TOOLBAR + PAD_TOP + r as f32 * ch;
+        let accent = ui.accent;
+        for &(r, c0, c1) in &hit.spans {
+            let (x0, w) = (PAD_X + c0 as f32 * cw, (c1 - c0) as f32 * cw);
+            // a soft wash behind the path and a firm line under it
+            ui.fill([x0 - 2.0, row_y(r) + 1.0, w + 4.0, ch - 2.0], 5.0, accent, 0.18);
+            ui.fill([x0 - 1.0, row_y(r) + ch - 3.5, w + 2.0, 2.5], 1.25, accent, 1.0);
+        }
+        let waited = self.peek_since.elapsed();
+        if waited < Duration::from_millis(260) {
+            host.redraw = true;
+            return;
+        }
+        let Some(&(r, c0, _)) = hit.spans.first() else { return };
+        let prev = self.peek.get(&hit.path, &self.tx);
+        let name = hit.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let (win_w, win_h) = (self.width as f32, self.height as f32);
+        // the card: the picture (at most 360 x 280) over its name, size and a hint
+        let (pw, ph, caption) = match &prev {
+            Some(p) => {
+                let k = (360.0 / p.pic.w as f32).min(280.0 / p.pic.h as f32).min(1.0).max(0.05);
+                ((p.pic.w as f32 * k).round(), (p.pic.h as f32 * k).round(), p.caption())
+            }
+            None => (160.0, 60.0, "Loading\u{2026}".to_string()),
+        };
+        let name = chebrium::widgets::fit(ui, &name, 12.0, true, 340.0);
+        let cap_w = ui.measure_raw(&caption, 11.0, false).max(ui.measure_raw(&name, 12.0, true)).max(ui.measure_raw("Ctrl+click to open", 11.0, false));
+        let (cw_card, ch_card) = (pw.max(cap_w) + 20.0, 10.0 + ph + 8.0 + 15.0 + 14.0 + 15.0 + 8.0);
+        let x = (PAD_X + c0 as f32 * cw).min(win_w - cw_card - 8.0).max(8.0);
+        let below = row_y(r) + ch + 8.0;
+        let y = if below + ch_card <= win_h - 8.0 { below } else { (row_y(r) - 8.0 - ch_card).max(TOOLBAR + 4.0) };
+        let card = [x, y, cw_card, ch_card];
+        let (ink, dark) = (ui.ink, ui.dark);
+        ui.ink = [1.0; 3];
+        ui.dark = true;
+        ui.glass(card, 18.0, 1.4);
+        let t = (waited.as_secs_f32() - 0.26) / 0.12;
+        let a = t.clamp(0.0, 1.0);
+        if a < 1.0 {
+            host.redraw = true;
+        }
+        match &prev {
+            Some(p) => ui.picture([x + 10.0 + (pw.max(cap_w) - pw) / 2.0, y + 10.0, pw, ph], &p.pic, [0.0, 0.0, p.pic.w as f32, p.pic.h as f32], a),
+            None => host.redraw = true,
+        }
+        let ty = y + 10.0 + ph + 8.0 + 12.0;
+        ui.text_raw(x + 10.0, ty, &name, 12.0, true, [1.0; 3], 0.95 * a, chebrium::draw::Align::Left);
+        ui.text_raw(x + 10.0, ty + 15.0, &caption, 11.0, false, [1.0; 3], 0.6 * a, chebrium::draw::Align::Left);
+        ui.text_raw(x + 10.0, ty + 30.0, "Ctrl+click to open", 11.0, false, [1.0; 3], 0.4 * a, chebrium::draw::Align::Left);
+        ui.ink = ink;
+        ui.dark = dark;
     }
 
     /// Bring the bands up to date: a band is painted again only when what it shows has changed.
@@ -925,6 +1068,14 @@ impl app::App for Term {
         }
         self.draw_cursor(ui, ui.dt(), host);
         self.draw_scrollbar(ui, rows, host);
+        if self.peek_hit.is_none() {
+            // a test hook: show the preview of this file at once, as if the pointer rested on a path in row 3
+            if let Some(p) = std::env::var_os("TERM_PEEK_TEST") {
+                self.peek_hit = Some(Hit { path: p.into(), spans: vec![(3, 2, 30)] });
+                self.peek_since = Instant::now();
+            }
+        }
+        self.draw_peek(ui, host);
         if !self.slide.at_rest() {
             host.redraw = true;
         }
@@ -1397,6 +1548,9 @@ fn main() {
         next_id: 0,
         mouse: (-1.0, -1.0),
         hover: Hover::None,
+        peek: Peek::default(),
+        peek_hit: None,
+        peek_since: Instant::now(),
         selecting: false,
         buttons: 0,
         last_click: None,
